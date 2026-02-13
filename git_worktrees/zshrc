@@ -1,0 +1,142 @@
+git_start() {
+  ticket=$1             # e.g., acme-123
+  base=${2:-main}       # optional base branch (default: main)
+  repo=${3:-origin}     # remote (default: origin)
+  label=${4:-stacked}   # PR label (default: stacked)
+
+  if [ -z "$ticket" ]; then
+    echo "Usage: git_start <TICKET> [BASE_BRANCH] [REMOTE] [LABEL]"
+    return 1
+  fi
+
+  # Ensure we're in git
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Not inside a git repository."
+    return 1
+  fi
+
+  # -----------------------------
+  # 1️⃣ Detect main repository root
+  # -----------------------------
+git_dir=$(git rev-parse --git-dir)
+
+# make it absolute
+git_dir=$(cd "$git_dir" && pwd)
+
+# strip everything from /.git onward
+main_repo_root="${git_dir%%/.git*}"
+
+
+  # -----------------------------
+  # 2️⃣ Determine next branch number
+  # -----------------------------
+  last_branch=$(git ls-remote --heads $repo "$ticket-*" | awk -F'/' '{print $3}' | sort | tail -n1)
+  
+  if [ -z "$last_branch" ]; then
+    branch="${ticket}-1"
+    pr_number=1
+    pr_base="$base"
+  else
+    num=$(echo $last_branch | grep -o '[0-9]\+$')
+    next_num=$((num + 1))
+    branch="${ticket}-${next_num}"
+    pr_number=$next_num
+    pr_base="$last_branch"
+  fi
+
+  # -----------------------------
+  # 3️⃣ Create central worktree folder
+  # -----------------------------
+  folder="${main_repo_root}_worktrees/$branch"
+  mkdir -p "${main_repo_root}_worktrees"
+
+  echo "Creating branch $branch based on $pr_base in worktree $folder..."
+  git worktree add -b $branch "$folder" "$pr_base"
+
+  cd "$folder" || return
+
+  # -----------------------------
+  # 4️⃣ Push branch upstream
+  # -----------------------------
+  echo "Pushing branch $branch to $repo..."
+  git push -u $repo "$branch"
+}
+
+git_open_pr() {
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Not inside a git repository."
+    return 1
+  fi
+
+  branch=$(git rev-parse --abbrev-ref HEAD)
+
+  # Parse branch
+  index="${branch##*-}"
+  ticket="${branch%-*}"
+
+  if [[ ! "$index" =~ ^[0-9]+$ ]]; then
+    echo "Branch must be formatted <ticket>-<number>"
+    return 1
+  fi
+
+  # Determine base branch
+  if [ "$index" -eq 1 ]; then
+    base="main"
+  else
+    prev=$((index - 1))
+    base="$ticket-$prev"
+  fi
+
+  # Ensure commits exist
+  if [ -z "$(git log "${base}..HEAD" --oneline)" ]; then
+    echo "No commits between $base and $branch. Commit first."
+    return 1
+  fi
+
+  # Push branch
+  git push -u origin "$branch" || return 1
+
+  # Count stack size (from repo root to avoid worktree nesting issues)
+  main_repo_root=$(git rev-parse --show-toplevel)
+  cd "$main_repo_root" || return 1
+  stack_branches=$(git branch --list "$ticket-*")
+  total=$(echo "$stack_branches" | wc -l | tr -d ' ')
+  cd - >/dev/null || return 1
+
+  # Latest commit message (no type parsing)
+  message=$(git log -1 --pretty=%s)
+
+  # Uppercase ticket
+  ticket_upper=$(echo "$ticket" | tr '[:lower:]' '[:upper:]')
+
+  title="$ticket_upper $message ($index/$total)"
+
+  # Ensure stacked label exists
+  if ! gh label list | grep -q "^stacked"; then
+    gh label create stacked \
+      --color 5319e7 \
+      --description "Part of a stacked PR series"
+  fi
+
+  body="Stack position: $index of $total
+Base branch: $base"
+
+  if [ "$index" -gt 1 ]; then
+    body="$body
+Depends on: $base"
+  fi
+
+  gh pr create \
+    --base "$base" \
+    --head "$branch" \
+    --title "$title" \
+    --body "$body" \
+    --label stacked
+
+  echo ""
+  echo "PR created:"
+  echo "Title: $title"
+  echo "Base: $base"
+  echo ""
+}
+
